@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Запуск GUI-обёртки VPN Gate. См. vpn_gate_ui/."""
+
+from vpn_gate_ui.app import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

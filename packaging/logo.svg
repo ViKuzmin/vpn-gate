@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <!-- Гradients -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#35373b"/>
+      <stop offset="100%" stop-color="#1e2022"/>
+    </linearGradient>
+    <linearGradient id="shieldGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#2ec27e"/>
+      <stop offset="100%" stop-color="#26a269"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Фон (скругленный квадрат в стиле GNOME App Icon) -->
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#bgGrad)" />
+
+  <!-- Внешний защитный контур / Щит-Шлюз -->
+  <path d="M 64 24 C 84 24, 96 30, 96 30 V 62 C 96 82, 64 102, 64 102 C 64 102, 32 82, 32 62 V 30 C 32 30, 44 24, 64 24 Z"
+        fill="none" stroke="url(#shieldGrad)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Дужка замка (VPN Gate) -->
+  <path d="M 48 54 V 44 C 48 35.16 55.16 28 64 28 C 72.84 28 80 35.16 80 44 V 54"
+        fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Тело замка -->
+  <rect x="44" y="52" width="40" height="32" rx="6" fill="url(#shieldGrad)"/>
+
+  <!-- Индикатор соединения / Замочная скважина -->
+  <circle cx="64" cy="64" r="4" fill="#ffffff"/>
+  <path d="M 64 68 L 64 76" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,8 @@
+vpn-gate (0.1.0) unstable; urgency=low
+
+  * Initial release: bash CLI installer (install-vpn-gate.sh) and
+    GTK4/libadwaita GUI for managing VPN-gated applications.
+  * Launch-block event log with a viewer in the GUI.
+  * Adaptive window sizing based on screen resolution.
+
+ -- ViKuzmin <96813456+ViKuzmin@users.noreply.github.com>  Sun, 06 Sep 2026 17:55:00 +0300
