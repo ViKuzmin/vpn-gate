@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=VPN Gate
+Comment=Управление приложениями, защищёнными VPN
+Exec=/usr/bin/vpn-gate-ui
+Icon=vpn-gate
+Terminal=false
+StartupNotify=true
+Categories=Network;

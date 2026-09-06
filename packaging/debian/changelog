@@ -1,0 +1,13 @@
+vpn-gate (0.1.0) unstable; urgency=low
+
+  * Initial release: bash CLI installer (install-vpn-gate.sh) and
+    GTK4/libadwaita GUI for managing VPN-gated applications.
+  * Works with any VPN client (WireGuard, Amnezia, OpenVPN, Tailscale, ...)
+    via a configurable network interface name.
+  * Launch-block event log with a viewer in the GUI.
+  * Adaptive window sizing based on screen resolution.
+  * Launch a protected app with custom command-line arguments from the GUI.
+  * Custom application icon, .desktop integration, autostart support.
+  * MIT-licensed; packaged as a Debian .deb (packaging/build-deb.sh).
+
+ -- ViKuzmin <96813456+ViKuzmin@users.noreply.github.com>  Sun, 06 Sep 2026 17:55:00 +0300

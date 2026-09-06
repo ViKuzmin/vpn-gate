@@ -1,0 +1,20 @@
+Package: vpn-gate
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: all
+Depends: bash, python3 (>= 3.9), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1
+Recommends: iproute2, libnotify-bin
+Maintainer: ViKuzmin <96813456+ViKuzmin@users.noreply.github.com>
+Homepage: https://github.com/ViKuzmin/vpn-gate
+Description: Launch-time VPN gate for Linux apps — CLI installer + GTK4 GUI
+ VPN Gate wraps any Linux application so it refuses to start unless a
+ configured VPN network interface is up. The check happens at launch
+ time: the wrapper either execs the real binary transparently or blocks
+ it and logs the attempt. Works with any VPN client (WireGuard, Amnezia,
+ OpenVPN, Tailscale, ...) — just point it at the right interface name.
+ .
+ Includes two tools:
+  - vpn-gate-install: bash CLI to install/remove the gate for an app
+  - vpn-gate-ui: GTK4/libadwaita GUI to manage protected apps, see
+    live VPN status and review a log of blocked launch attempts
