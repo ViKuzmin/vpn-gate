@@ -8,7 +8,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
-from . import core, dialogs, settings, sizing, vpncheck  # noqa: E402
+from . import core, dialogs, settings, sizing, vpncheck, vpnns  # noqa: E402
 
 _NARROW_WIDTH_PX = 480
 
@@ -62,6 +62,32 @@ class MainWindow(Adw.ApplicationWindow):
         self.status_box.append(status_texts)
         self.status_box.append(self.check_btn)
         root_box.append(self.status_box)
+
+        # Kill switch namespace panel
+        self.ns_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10,
+                               margin_top=0, margin_bottom=14, margin_start=18, margin_end=18)
+        self.ns_icon = Gtk.Image(icon_name="network-wired-symbolic", pixel_size=22)
+        ns_texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        self.ns_label = Gtk.Label(xalign=0, wrap=True, label="Kill switch namespace")
+        self.ns_label.add_css_class("heading")
+        self.ns_sub_label = Gtk.Label(xalign=0, wrap=True)
+        self.ns_sub_label.add_css_class("dim-label")
+        self.ns_sub_label.add_css_class("caption")
+        ns_texts.append(self.ns_label)
+        ns_texts.append(self.ns_sub_label)
+        ns_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.ns_repair_btn = Gtk.Button(label="Repair", valign=Gtk.Align.CENTER)
+        self.ns_repair_btn.set_tooltip_text("Восстановить маршруты после reconnect VPN")
+        self.ns_repair_btn.connect("clicked", self._on_ns_repair)
+        self.ns_down_btn = Gtk.Button(label="Down", valign=Gtk.Align.CENTER)
+        self.ns_down_btn.set_tooltip_text("Снять namespace kill switch")
+        self.ns_down_btn.connect("clicked", self._on_ns_down)
+        ns_btns.append(self.ns_repair_btn)
+        ns_btns.append(self.ns_down_btn)
+        self.ns_box.append(self.ns_icon)
+        self.ns_box.append(ns_texts)
+        self.ns_box.append(ns_btns)
+        root_box.append(self.ns_box)
         root_box.append(Gtk.Separator())
 
         self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
@@ -112,6 +138,7 @@ class MainWindow(Adw.ApplicationWindow):
         breakpoint_ = Adw.Breakpoint.new(condition)
         breakpoint_.add_setter(self.status_box, "orientation", Gtk.Orientation.VERTICAL)
         breakpoint_.add_setter(self.check_btn, "halign", Gtk.Align.FILL)
+        breakpoint_.add_setter(self.ns_box, "orientation", Gtk.Orientation.VERTICAL)
         breakpoint_.add_setter(self.bottom_bar, "orientation", Gtk.Orientation.VERTICAL)
         self.add_breakpoint(breakpoint_)
 
@@ -138,6 +165,38 @@ class MainWindow(Adw.ApplicationWindow):
             self.status_label.add_css_class("error")
             self.status_sub_label.set_text(f"проверялись: {', '.join(ifaces)}")
 
+        self._refresh_ns_status()
+
+    def _refresh_ns_status(self) -> None:
+        st = vpnns.query_status()
+        self.ns_sub_label.set_text(st.detail)
+        self.ns_repair_btn.set_sensitive(st.available and st.ns_exists)
+        self.ns_down_btn.set_sensitive(st.available and st.ns_exists)
+        if not st.available:
+            self.ns_icon.set_from_icon_name("dialog-warning-symbolic")
+        elif st.vpn_routes:
+            self.ns_icon.set_from_icon_name("emblem-ok-symbolic")
+        elif st.ns_exists:
+            self.ns_icon.set_from_icon_name("network-offline-symbolic")
+        else:
+            self.ns_icon.set_from_icon_name("network-wired-symbolic")
+
+    def _on_ns_repair(self, *_args) -> None:
+        try:
+            msg = vpnns.ns_repair()
+            self._toast(msg.splitlines()[-1] if msg else "Repair OK")
+        except Exception as exc:  # noqa: BLE001 — показываем пользователю
+            dialogs.show_error(self, "Repair не удался", str(exc))
+        self._refresh_ns_status()
+
+    def _on_ns_down(self, *_args) -> None:
+        try:
+            msg = vpnns.ns_down()
+            self._toast(msg.splitlines()[-1] if msg else "Namespace снят")
+        except Exception as exc:  # noqa: BLE001
+            dialogs.show_error(self, "Down не удался", str(exc))
+        self._refresh_ns_status()
+
     def refresh_all(self) -> None:
         self.refresh_status()
         child = self.listbox.get_first_child()
@@ -154,6 +213,8 @@ class MainWindow(Adw.ApplicationWindow):
         details = [f"iface: {app_info.ifaces}"]
         if app_info.strict:
             details.append("строгий режим")
+        if app_info.killswitch:
+            details.append("kill switch")
         details.append(app_info.status_text)
         row.set_subtitle(" · ".join(details))
 

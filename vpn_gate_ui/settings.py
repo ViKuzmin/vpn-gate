@@ -20,8 +20,9 @@ ICON_NAME = "vpn-gate"
 
 @dataclass
 class UiSettings:
-    default_ifaces: str = "wg0"
+    default_ifaces: str = "amn0"
     default_strict: bool = False
+    default_killswitch: bool = False
     notifications_enabled: bool = True
     autostart_enabled: bool = False
     poll_interval_sec: int = 5

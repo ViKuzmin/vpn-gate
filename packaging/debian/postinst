@@ -9,4 +9,12 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -f -q /usr/share/icons/hicolor || true
 fi
 
+# Проверяем sudoers drop-in, чтобы не сломать sudo при битом файле.
+if [ -f /etc/sudoers.d/vpn-ns-run ] && command -v visudo >/dev/null 2>&1; then
+    if ! visudo -cf /etc/sudoers.d/vpn-ns-run >/dev/null 2>&1; then
+        echo "vpn-gate: /etc/sudoers.d/vpn-ns-run невалиден — удаляю" >&2
+        rm -f /etc/sudoers.d/vpn-ns-run
+    fi
+fi
+
 exit 0

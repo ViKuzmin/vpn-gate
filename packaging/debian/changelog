@@ -1,3 +1,12 @@
+vpn-gate (0.2.0) unstable; urgency=low
+
+  * Add vpn-ns-run: network-namespace kill switch for Amnezia/WireGuard.
+  * Auto-repair watcher restores routes after VPN reconnect.
+  * GUI: per-app kill switch toggle, namespace status, Repair/Down actions.
+  * Ship sudoers.d rule so netdev/sudo can run vpn-ns-run without a password.
+
+ -- ViKuzmin <96813456+ViKuzmin@users.noreply.github.com>  Fri, 18 Sep 2026 10:00:00 +0300
+
 vpn-gate (0.1.0) unstable; urgency=low
 
   * Initial release: bash CLI installer (install-vpn-gate.sh) and

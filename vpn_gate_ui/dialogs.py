@@ -95,6 +95,14 @@ class AddAppDialog(Adw.Window):
         self.strict_row = strict_row
         group.add(strict_row)
 
+        kill_row = Adw.SwitchRow(
+            title="Kill switch (namespace)",
+            subtitle="Интернет у приложения только через VPN; при обрыве — тишина",
+        )
+        kill_row.set_active(ui_settings.default_killswitch)
+        self.killswitch_row = kill_row
+        group.add(kill_row)
+
         self.error_label = Gtk.Label(wrap=True, xalign=0, visible=False)
         self.error_label.add_css_class("error")
 
@@ -149,6 +157,7 @@ class AddAppDialog(Adw.Window):
         real = self.real_entry.get_text().strip() or None
         ifaces = self.ifaces_entry.get_text().strip() or "wg0"
         strict = self.strict_row.get_active()
+        killswitch = self.killswitch_row.get_active()
 
         if not app:
             self._show_inline_error("Укажите имя приложения.")
@@ -159,7 +168,13 @@ class AddAppDialog(Adw.Window):
 
         self.install_btn.set_sensitive(False)
         try:
-            core.do_install(app, real_bin_override=real, ifaces=ifaces, strict=strict)
+            core.do_install(
+                app,
+                real_bin_override=real,
+                ifaces=ifaces,
+                strict=strict,
+                killswitch=killswitch,
+            )
         except core.GateError as exc:
             self._show_inline_error(str(exc))
             self.install_btn.set_sensitive(True)
@@ -288,6 +303,14 @@ class EditAppDialog(Adw.Window):
         self.strict_row = strict_row
         group.add(strict_row)
 
+        kill_row = Adw.SwitchRow(
+            title="Kill switch (namespace)",
+            subtitle="Запуск через vpn-ns-run: трафик только через VPN",
+        )
+        kill_row.set_active(app_info.killswitch)
+        self.killswitch_row = kill_row
+        group.add(kill_row)
+
         self.check_result = Gtk.Label(wrap=True, xalign=0)
         check_row = Adw.ActionRow(title="Проверка")
         check_btn = Gtk.Button(label="Проверить сейчас", valign=Gtk.Align.CENTER)
@@ -360,10 +383,13 @@ class EditAppDialog(Adw.Window):
         real = self.real_entry.get_text().strip()
         ifaces = self.ifaces_entry.get_text().strip() or "wg0"
         strict = self.strict_row.get_active()
+        killswitch = self.killswitch_row.get_active()
 
         if real:
             core.write_real_bin(self._app, real)
-        core.write_config(self._app, ifaces, strict)
+        core.write_config(self._app, ifaces, strict, killswitch)
+        # Обновляем gate-скрипт (шаблон мог измениться / нужен kill switch).
+        core.write_app_gate(core.BIN_DIR / f"{self._app}{core.GATE_SUFFIX}", self._app)
         self._on_saved()
         self.close()
 
@@ -483,6 +509,13 @@ class SettingsDialog(Adw.Window):
         self.strict_row.set_active(self._ui_settings.default_strict)
         group.add(self.strict_row)
 
+        self.killswitch_row = Adw.SwitchRow(
+            title="Kill switch по умолчанию",
+            subtitle="Новые приложения — в network namespace (vpn-ns-run)",
+        )
+        self.killswitch_row.set_active(self._ui_settings.default_killswitch)
+        group.add(self.killswitch_row)
+
         group2 = Adw.PreferencesGroup(title="Приложение")
         self.notify_row = Adw.SwitchRow(title="Уведомления",
                                          subtitle="Показывать системные уведомления о блокировке")
@@ -516,6 +549,7 @@ class SettingsDialog(Adw.Window):
     def _on_save(self, *_args) -> None:
         self._ui_settings.default_ifaces = self.ifaces_entry.get_text().strip() or "wg0"
         self._ui_settings.default_strict = self.strict_row.get_active()
+        self._ui_settings.default_killswitch = self.killswitch_row.get_active()
         self._ui_settings.notifications_enabled = self.notify_row.get_active()
         autostart = self.autostart_row.get_active()
         self._ui_settings.autostart_enabled = autostart
