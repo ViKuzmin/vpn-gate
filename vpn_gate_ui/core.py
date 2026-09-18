@@ -58,7 +58,7 @@ VPN_CHECK_SCRIPT = r"""#!/usr/bin/env bash
 set -euo pipefail
 
 CONFIG_FILE="${VPN_GATE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/vpn-gate/config}"
-IFACES=(wg0)
+IFACES=(amn0 wg0)
 
 # Env overrides config (preserve before source).
 _PRESET_IFACES="${VPN_IFACES-}"
@@ -228,7 +228,83 @@ resolve_real_bin() {
   return 1
 }
 
+resolve_vpn_ns_run() {
+  if [[ -n "${VPN_NS_RUN:-}" && -x "${VPN_NS_RUN}" ]]; then
+    printf '%s\n' "${VPN_NS_RUN}"
+    return 0
+  fi
+  local candidate self_dir
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+  for candidate in \
+    /usr/bin/vpn-ns-run \
+    /usr/local/bin/vpn-ns-run \
+    "${XDG_BIN_HOME:-$HOME/.local/bin}/vpn-ns-run" \
+    "${self_dir}/vpn-ns-run"
+  do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  if command -v vpn-ns-run >/dev/null 2>&1; then
+    command -v vpn-ns-run
+    return 0
+  fi
+  return 1
+}
+
+run_via_killswitch() {
+  local real="$1"
+  shift
+  local ns_run
+
+  # sudoers NOPASSWD привязан к /usr/bin/vpn-ns-run — всегда предпочитаем его.
+  if [[ -x /usr/bin/vpn-ns-run ]]; then
+    ns_run=/usr/bin/vpn-ns-run
+  else
+    ns_run="$(resolve_vpn_ns_run)" || {
+      notify "$APP: нет vpn-ns-run" "Установите vpn-ns-run в /usr/bin (пакет vpn-gate) или отключите kill switch."
+      exit 127
+    }
+  fi
+
+  export VPN_IFACES="${VPN_IFACES:-}"
+  if [[ -n "${VPN_IFACES}" ]]; then
+    # Первый интерфейс из списка — предпочтительный для namespace.
+    export VPN_IFACE="${VPN_IFACE:-${VPN_IFACES%% *}}"
+  fi
+
+  if [[ "${EUID}" -eq 0 ]]; then
+    exec "$ns_run" "$real" "$@"
+  fi
+
+  if ! command -v sudo >/dev/null 2>&1; then
+    notify "$APP: нужен sudo" "Для kill switch установите sudo и правило NOPASSWD на /usr/bin/vpn-ns-run."
+    exit 126
+  fi
+
+  # Проверяем NOPASSWD именно для vpn-ns-run, НЕ через «sudo -n true».
+  # Не используем --preserve-env: Debian env_reset запрещает часть переменных
+  # и валит весь запуск. DISPLAY/XAUTHORITY обычно в env_keep sudo.
+  if sudo -n -- "$ns_run" --status >/dev/null 2>&1; then
+    exec sudo -n -- "$ns_run" "$real" "$@"
+  fi
+
+  # Из GUI (нет TTY) интерактивный sudo бесполезен — сразу понятная ошибка.
+  if [[ ! -t 0 ]]; then
+    notify "$APP: нет NOPASSWD для vpn-ns-run" \
+      "Выполните: sudo install -m0755 vpn-ns-run /usr/bin/ && sudo install -m0440 packaging/sudoers.d/vpn-ns-run /etc/sudoers.d/"
+    exit 126
+  fi
+
+  exec sudo -- "$ns_run" "$real" "$@"
+}
+
+
 export VPN_GATE_CONFIG="${VPN_GATE_CONFIG:-$CFG_DIR/config}"
+
+# shellcheck disable=SC1090
+[[ -f "$VPN_GATE_CONFIG" ]] && source "$VPN_GATE_CONFIG" || true
 
 if ! "$CHECK" >/dev/null; then
   notify "$APP заблокирован" "Включите VPN и попробуйте снова."
@@ -239,6 +315,10 @@ REAL="$(resolve_real_bin)" || {
   notify "$APP не найден" "Укажите REAL_BIN при установке или переустановите gate."
   exit 127
 }
+
+if [[ "${VPN_KILLSWITCH:-0}" == "1" ]]; then
+  run_via_killswitch "$REAL" "$@"
+fi
 
 exec "$REAL" "$@"
 """
@@ -345,8 +425,8 @@ def install_desktop_override(app: str, wrapper: Path) -> None:
 # Конфиг приложения (интерфейсы, строгий режим, путь к реальному бинарнику)
 # --------------------------------------------------------------------------
 
-def parse_config(config_path: Path) -> tuple[str, bool]:
-    ifaces, strict = "wg0", False
+def parse_config(config_path: Path) -> tuple[str, bool, bool]:
+    ifaces, strict, killswitch = "wg0", False, False
     if config_path.is_file():
         text = config_path.read_text(errors="ignore")
         m = re.search(r'VPN_IFACES\s*=\s*"([^"]*)"', text)
@@ -355,10 +435,13 @@ def parse_config(config_path: Path) -> tuple[str, bool]:
         m2 = re.search(r"VPN_STRICT_ROUTE\s*=\s*\"?([01])\"?", text)
         if m2:
             strict = m2.group(1) == "1"
-    return ifaces, strict
+        m3 = re.search(r"VPN_KILLSWITCH\s*=\s*\"?([01])\"?", text)
+        if m3:
+            killswitch = m3.group(1) == "1"
+    return ifaces, strict, killswitch
 
 
-def write_config(app: str, ifaces: str, strict: bool) -> None:
+def write_config(app: str, ifaces: str, strict: bool, killswitch: bool = False) -> None:
     cfg_dir = cfg_dir_for(app)
     cfg_dir.mkdir(parents=True, exist_ok=True)
     config_path = cfg_dir / "config"
@@ -366,7 +449,9 @@ def write_config(app: str, ifaces: str, strict: bool) -> None:
         "# Сетевые интерфейсы VPN (через пробел)\n"
         f'VPN_IFACES="{ifaces}"\n\n'
         "# 1 = требовать маршрут через VPN-интерфейс\n"
-        f"VPN_STRICT_ROUTE={1 if strict else 0}\n"
+        f"VPN_STRICT_ROUTE={1 if strict else 0}\n\n"
+        "# 1 = запускать в network namespace (kill switch, только через VPN)\n"
+        f"VPN_KILLSWITCH={1 if killswitch else 0}\n"
     )
     config_path.chmod(0o644)
 
@@ -406,6 +491,7 @@ def do_install(
     real_bin_override: str | None = None,
     ifaces: str = "wg0",
     strict: bool = False,
+    killswitch: bool = False,
 ) -> InstallResult:
     _require_ident(app)
 
@@ -436,17 +522,25 @@ def do_install(
     write_vpn_check(BIN_DIR / CHECK_NAME)
     write_app_gate(gate, app)
     write_real_bin(app, real)
-
-    if not (cfg_dir / "config").exists():
-        write_config(app, ifaces, strict)
+    write_config(app, ifaces, strict, killswitch)
 
     q_real = shlex.quote(real)
     q_check = shlex.quote(str(BIN_DIR / CHECK_NAME))
     q_gate = shlex.quote(str(gate))
     q_cfg = shlex.quote(str(cfg_dir / "config"))
 
+    # vpn-ns-run: не подставляем путь из репо, если есть системный —
+    # иначе sudoers NOPASSWD на /usr/bin/vpn-ns-run не сработает.
+    ns_hint = ""
+    system_ns = Path("/usr/bin/vpn-ns-run")
+    if not system_ns.is_file():
+        repo_ns = Path(__file__).resolve().parent.parent / "vpn-ns-run"
+        if repo_ns.is_file():
+            ns_hint = f"export VPN_NS_RUN={shlex.quote(str(repo_ns))}\n"
+
     wrapper.write_text(
         "#!/usr/bin/env bash\n"
+        f"{ns_hint}"
         f"export VPN_GATE_REAL_BIN={q_real}\n"
         f"export VPN_GATE_CHECK={q_check}\n"
         f"export VPN_GATE_CONFIG={q_cfg}\n"
@@ -495,20 +589,48 @@ def launch_wrapper(app: str, args: list[str]) -> None:
     """Запускает обёртку приложения (~/.local/bin/<app>) с заданными аргументами.
 
     Обёртка сама решит, пропускать запуск или блокировать (в зависимости от
-    состояния VPN) — здесь только детач-запуск процесса, без ожидания.
+    состояния VPN). При мгновенном отказе (exit ≠ 0 за ~0.4с) поднимаем GateError,
+    чтобы GUI показал причину вместо ложного «запущен».
     """
     _require_ident(app)
     wrapper = BIN_DIR / app
     if not wrapper.is_file():
         raise GateError(f"Обёртка для «{app}» не найдена: {wrapper}")
 
-    subprocess.Popen(
-        [str(wrapper), *args],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    # Не глотаем stderr — иначе из GUI не видно, почему kill switch отказал.
+    log_dir = LOG_DIR
+    log_dir.mkdir(parents=True, exist_ok=True)
+    launch_log = log_dir / "launch-stderr.log"
+    stderr_f = launch_log.open("ab")
+    try:
+        proc = subprocess.Popen(
+            [str(wrapper), *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_f,
+            start_new_session=True,
+        )
+    finally:
+        stderr_f.close()
+
+    # Короткая пауза: gate при отказе выходит сразу (126/127).
+    try:
+        code = proc.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        return  # процесс жив — ок
+
+    if code != 0:
+        hint = ""
+        try:
+            tail = launch_log.read_text(errors="ignore").splitlines()[-3:]
+            if tail:
+                hint = "\n" + "\n".join(tail)
+        except OSError:
+            pass
+        raise GateError(
+            f"«{app}» завершился с кодом {code}.{hint}\n"
+            "Если включён kill switch — проверьте sudo NOPASSWD для /usr/bin/vpn-ns-run."
+        )
 
 
 @dataclass
@@ -517,6 +639,7 @@ class AppInfo:
     real_bin: str | None
     ifaces: str
     strict: bool
+    killswitch: bool
     wrapper_exists: bool
     gate_path: Path
     wrapper_path: Path
@@ -533,6 +656,8 @@ class AppInfo:
             return "путь не задан"
         if not os.access(self.real_bin, os.X_OK):
             return "бинарник не найден"
+        if self.killswitch:
+            return "OK · kill switch"
         return "OK"
 
 
@@ -580,7 +705,7 @@ def list_gated_apps() -> list[AppInfo]:
             continue
         cfg_dir = cfg_dir_for(app)
         real_bin = read_real_bin(app)
-        ifaces, strict = parse_config(cfg_dir / "config")
+        ifaces, strict, killswitch = parse_config(cfg_dir / "config")
         wrapper_path = BIN_DIR / app
         result.append(
             AppInfo(
@@ -588,6 +713,7 @@ def list_gated_apps() -> list[AppInfo]:
                 real_bin=real_bin,
                 ifaces=ifaces,
                 strict=strict,
+                killswitch=killswitch,
                 wrapper_exists=wrapper_path.exists(),
                 gate_path=gate_path,
                 wrapper_path=wrapper_path,

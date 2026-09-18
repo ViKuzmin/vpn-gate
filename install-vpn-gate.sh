@@ -23,7 +23,8 @@ usage() {
 
 Переменные окружения:
   REAL_BIN     полный путь к настоящему бинарнику (если не в PATH / неоднозначно)
-  VPN_IFACES   интерфейсы через пробел (по умолчанию wg0), пишется в config при первой установке
+  VPN_IFACES   интерфейсы через пробел (по умолчанию amn0), пишется в config при первой установке
+  VPN_KILLSWITCH  1 = запускать приложение в network namespace (vpn-ns-run)
 EOF
   exit 2
 }
@@ -44,7 +45,7 @@ write_vpn_check() {
 set -euo pipefail
 
 CONFIG_FILE="${VPN_GATE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/vpn-gate/config}"
-IFACES=(wg0)
+IFACES=(amn0 wg0)
 
 # Env overrides config (preserve before source).
 _PRESET_IFACES="${VPN_IFACES-}"
@@ -223,7 +224,79 @@ resolve_real_bin() {
   return 1
 }
 
+resolve_vpn_ns_run() {
+  if [[ -n "\${VPN_NS_RUN:-}" && -x "\${VPN_NS_RUN}" ]]; then
+    printf '%s\\n' "\${VPN_NS_RUN}"
+    return 0
+  fi
+  local candidate self_dir
+  self_dir="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+  for candidate in \\
+    /usr/bin/vpn-ns-run \\
+    /usr/local/bin/vpn-ns-run \\
+    "\${XDG_BIN_HOME:-\$HOME/.local/bin}/vpn-ns-run" \\
+    "\${self_dir}/vpn-ns-run"
+  do
+    if [[ -x "\$candidate" ]]; then
+      printf '%s\\n' "\$candidate"
+      return 0
+    fi
+  done
+  if command -v vpn-ns-run >/dev/null 2>&1; then
+    command -v vpn-ns-run
+    return 0
+  fi
+  return 1
+}
+
+run_via_killswitch() {
+  local real="\$1"
+  shift
+  local ns_run
+
+  # sudoers NOPASSWD привязан к /usr/bin/vpn-ns-run — всегда предпочитаем его.
+  if [[ -x /usr/bin/vpn-ns-run ]]; then
+    ns_run=/usr/bin/vpn-ns-run
+  else
+    ns_run="\$(resolve_vpn_ns_run)" || {
+      notify "\$APP: нет vpn-ns-run" "Установите vpn-ns-run в /usr/bin (пакет vpn-gate) или отключите kill switch."
+      exit 127
+    }
+  fi
+
+  export VPN_IFACES="\${VPN_IFACES:-}"
+  if [[ -n "\${VPN_IFACES}" ]]; then
+    export VPN_IFACE="\${VPN_IFACE:-\${VPN_IFACES%% *}}"
+  fi
+
+  if [[ "\${EUID}" -eq 0 ]]; then
+    exec "\$ns_run" "\$real" "\$@"
+  fi
+
+  if ! command -v sudo >/dev/null 2>&1; then
+    notify "\$APP: нужен sudo" "Для kill switch установите sudo и правило NOPASSWD на /usr/bin/vpn-ns-run."
+    exit 126
+  fi
+
+  # Проверяем NOPASSWD именно для vpn-ns-run, НЕ через «sudo -n true».
+  # Без --preserve-env: иначе Debian sudo отвергает часть переменных и валит запуск.
+  if sudo -n -- "\$ns_run" --status >/dev/null 2>&1; then
+    exec sudo -n -- "\$ns_run" "\$real" "\$@"
+  fi
+
+  if [[ ! -t 0 ]]; then
+    notify "\$APP: нет NOPASSWD для vpn-ns-run" \\
+      "Установите /usr/bin/vpn-ns-run и sudoers.d/vpn-ns-run (NOPASSWD)."
+    exit 126
+  fi
+
+  exec sudo -- "\$ns_run" "\$real" "\$@"
+}
+
 export VPN_GATE_CONFIG="\${VPN_GATE_CONFIG:-\$CFG_DIR/config}"
+
+# shellcheck disable=SC1090
+[[ -f "\$VPN_GATE_CONFIG" ]] && source "\$VPN_GATE_CONFIG" || true
 
 if ! "\$CHECK" >/dev/null; then
   notify "\$APP заблокирован" "Включите VPN и попробуйте снова."
@@ -234,6 +307,10 @@ REAL="\$(resolve_real_bin)" || {
   notify "\$APP не найден" "Укажите REAL_BIN при установке или переустановите gate."
   exit 127
 }
+
+if [[ "\${VPN_KILLSWITCH:-0}" == "1" ]]; then
+  run_via_killswitch "\$REAL" "\$@"
+fi
 
 exec "\$REAL" "\$@"
 GATE_EOF
@@ -368,10 +445,13 @@ do_install() {
   if [[ ! -f "$cfg_dir/config" ]]; then
     cat >"$cfg_dir/config" <<EOF
 # Сетевые интерфейсы VPN (через пробел)
-VPN_IFACES="${VPN_IFACES:-wg0}"
+VPN_IFACES="${VPN_IFACES:-amn0}"
 
 # 1 = требовать маршрут через VPN-интерфейс
 VPN_STRICT_ROUTE=0
+
+# 1 = запускать в network namespace (kill switch, только через VPN)
+VPN_KILLSWITCH=${VPN_KILLSWITCH:-0}
 EOF
     chmod 0644 "$cfg_dir/config"
   fi
@@ -381,9 +461,14 @@ EOF
   q_gate="$(printf '%q' "$gate")"
   q_cfg="$(printf '%q' "$cfg_dir/config")"
 
+  ns_hint=""
+  if [[ -x "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vpn-ns-run" ]]; then
+    ns_hint="export VPN_NS_RUN=$(printf '%q' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vpn-ns-run")"$'\n'
+  fi
+
   cat >"$wrapper" <<EOF
 #!/usr/bin/env bash
-export VPN_GATE_REAL_BIN=$q_real
+${ns_hint}export VPN_GATE_REAL_BIN=$q_real
 export VPN_GATE_CHECK=$q_check
 export VPN_GATE_CONFIG=$q_cfg
 exec $q_gate "\$@"

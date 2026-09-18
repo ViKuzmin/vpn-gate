@@ -10,7 +10,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-DEFAULT_IFACES = ["wg0"]
+DEFAULT_IFACES = ["amn0", "wg0"]
 
 
 def _iface_exists(iface: str) -> bool:

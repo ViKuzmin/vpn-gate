@@ -33,6 +33,11 @@ mkdir -p \
 # --- CLI-установщик ---
 install -m 0755 "$ROOT_DIR/install-vpn-gate.sh" "$STAGE/usr/bin/vpn-gate-install"
 
+# --- Kill switch (network namespace) ---
+install -m 0755 "$ROOT_DIR/vpn-ns-run" "$STAGE/usr/bin/vpn-ns-run"
+mkdir -p "$STAGE/etc/sudoers.d"
+install -m 0440 "$SCRIPT_DIR/sudoers.d/vpn-ns-run" "$STAGE/etc/sudoers.d/vpn-ns-run"
+
 # --- Python-пакет GUI ---
 cp -r "$ROOT_DIR/vpn_gate_ui" "$STAGE/usr/lib/python3/dist-packages/"
 find "$STAGE/usr/lib/python3/dist-packages/vpn_gate_ui" \

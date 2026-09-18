@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+# Запуск приложения в network namespace с доступом в интернет только через VPN.
+# Хост (init netns) не трогаем: amn0 остаётся у Amnezia, маршруты хоста не сбрасываем.
+#
+# Использование:
+#   sudo ./vpn-ns-run curl -4 ifconfig.me
+#   sudo ./vpn-ns-run --up
+#   sudo ./vpn-ns-run --down
+#   sudo ./vpn-ns-run --status
+#   sudo ./vpn-ns-run --repair
+#   VPN_IFACE=amn0 sudo ./vpn-ns-run firefox
+#
+# Kill switch: трафик из namespace уходит только в VPN_IFACE (NAT).
+# Если VPN упал — в namespace нет интернета (blackhole), утечки в Wi‑Fi нет.
+# После повторного включения VPN watcher восстанавливает маршруты/nft.
+set -euo pipefail
+
+NS_NAME="${VPN_NS_NAME:-vpnonly}"
+VETH_HOST="${VPN_VETH_HOST:-veth-vpn0}"
+VETH_NS="${VPN_VETH_NS:-veth-ns0}"
+HOST_IP="${VPN_HOST_IP:-10.200.200.1}"
+NS_IP="${VPN_NS_IP:-10.200.200.2}"
+SUBNET="${VPN_SUBNET:-10.200.200.0/24}"
+TABLE_ID="${VPN_TABLE_ID:-200}"
+RULE_PRIO="${VPN_RULE_PRIO:-100}"
+NFT_TABLE="${VPN_NFT_TABLE:-vpnonly_ks}"
+VPN_IFACE="${VPN_IFACE:-}"
+VPN_IFACES="${VPN_IFACES:-}"
+WATCH_PID_FILE="${VPN_NS_WATCH_PID:-/run/vpn-ns-${NS_NAME}.pid}"
+WATCH_INTERVAL_SEC="${VPN_NS_WATCH_INTERVAL:-2}"
+
+# Debian: ip/nft часто в /usr/sbin, а у обычного пользователя его нет в PATH.
+PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH:-}"
+export PATH
+IP_BIN="$(command -v ip)" || IP_BIN=/usr/sbin/ip
+NFT_BIN="$(command -v nft)" || NFT_BIN=/usr/sbin/nft
+SYSCTL_BIN="$(command -v sysctl)" || SYSCTL_BIN=/usr/sbin/sysctl
+RUNUSER_BIN="$(command -v runuser)" || RUNUSER_BIN=/usr/sbin/runuser
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+log() { printf 'vpn-ns: %s\n' "$*" >&2; }
+
+need_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    exec sudo --preserve-env=VPN_IFACE,VPN_IFACES,VPN_NS_NAME,VPN_VETH_HOST,VPN_VETH_NS,VPN_HOST_IP,VPN_NS_IP,VPN_SUBNET,VPN_TABLE_ID,VPN_RULE_PRIO,VPN_NFT_TABLE,VPN_NS_WATCH_PID,VPN_NS_WATCH_INTERVAL,DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS,HOME,LANG,LC_ALL,QT_QPA_PLATFORM,XDG_SESSION_TYPE \
+      -- "$0" "$@"
+  fi
+}
+
+candidate_ifaces() {
+  local -a list=()
+  local iface
+  if [[ -n "${VPN_IFACE}" ]]; then
+    list+=("${VPN_IFACE}")
+  fi
+  if [[ -n "${VPN_IFACES}" ]]; then
+    # shellcheck disable=SC2206
+    list+=(${VPN_IFACES})
+  fi
+  list+=(amn0 wg0 tun0)
+  for iface in "${list[@]}"; do
+    [[ -n "${iface}" ]] || continue
+    printf '%s\n' "${iface}"
+  done | awk 'NF && !seen[$0]++'
+}
+
+detect_vpn_iface() {
+  local iface
+  while IFS= read -r iface; do
+    if [[ -d "/sys/class/net/${iface}" ]]; then
+      printf '%s\n' "${iface}"
+      return 0
+    fi
+  done < <(candidate_ifaces)
+  return 1
+}
+
+vpn_is_up() {
+  local iface="$1" flags operstate
+  [[ -d "/sys/class/net/${iface}" ]] || return 1
+  if [[ -r "/sys/class/net/${iface}/operstate" ]]; then
+    operstate="$(<"/sys/class/net/${iface}/operstate")"
+  else
+    operstate=""
+  fi
+  if [[ -r "/sys/class/net/${iface}/flags" ]]; then
+    flags="$(<"/sys/class/net/${iface}/flags")"
+    (( flags & 0x1 )) || return 1
+  fi
+  [[ "${operstate}" == "up" || "${operstate}" == "unknown" || -z "${operstate}" ]]
+}
+
+vpn_mtu() {
+  local iface="$1"
+  cat "/sys/class/net/${iface}/mtu" 2>/dev/null || printf '1376'
+}
+
+ns_exists() {
+  [[ -e "/var/run/netns/${NS_NAME}" ]] || ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "${NS_NAME}"
+}
+
+routes_ok_for() {
+  local iface="$1"
+  ip route show table "${TABLE_ID}" 2>/dev/null | grep -q "dev ${iface}"
+}
+
+cleanup_stale_links() {
+  ip link del "${VETH_HOST}" 2>/dev/null || true
+  ip link del "${VETH_NS}" 2>/dev/null || true
+}
+
+ensure_forwarding() {
+  local iface="$1"
+  "${SYSCTL_BIN}" -q -w net.ipv4.ip_forward=1
+  # Policy routing + NAT часто ломаются на strict rp_filter.
+  "${SYSCTL_BIN}" -q -w net.ipv4.conf.all.rp_filter=2
+  "${SYSCTL_BIN}" -q -w "net.ipv4.conf.${iface}.rp_filter=2" 2>/dev/null || true
+  "${SYSCTL_BIN}" -q -w "net.ipv4.conf.${VETH_HOST}.rp_filter=2" 2>/dev/null || true
+}
+
+install_dns() {
+  mkdir -p "/etc/netns/${NS_NAME}"
+  # DNS Amnezia на amn0; без резолверов LAN — меньше риска утечки DNS.
+  cat >"/etc/netns/${NS_NAME}/resolv.conf" <<'EOF'
+nameserver 1.1.1.1
+nameserver 1.0.0.1
+options timeout:2 attempts:2
+EOF
+}
+
+flush_table() {
+  ip route flush table "${TABLE_ID}" 2>/dev/null || true
+}
+
+ensure_routes() {
+  local iface="$1"
+  flush_table
+  # Как у Amnezia: две половины интернета через TUN + blackhole как kill switch.
+  ip route replace "0.0.0.0/1" dev "${iface}" table "${TABLE_ID}"
+  ip route replace "128.0.0.0/1" dev "${iface}" table "${TABLE_ID}"
+  ip route replace blackhole default metric 100 table "${TABLE_ID}"
+  # Подсеть veth должна быть достижима в этой таблице для локальной доставки.
+  ip route replace "${SUBNET}" dev "${VETH_HOST}" table "${TABLE_ID}"
+}
+
+ensure_blackhole_only() {
+  flush_table
+  ip route replace blackhole default table "${TABLE_ID}"
+  if ip link show "${VETH_HOST}" >/dev/null 2>&1; then
+    ip route replace "${SUBNET}" dev "${VETH_HOST}" table "${TABLE_ID}"
+  fi
+}
+
+ensure_rule() {
+  if ! ip rule show | grep -q "from ${SUBNET} lookup ${TABLE_ID}"; then
+    ip rule add from "${SUBNET}" lookup "${TABLE_ID}" priority "${RULE_PRIO}"
+  fi
+}
+
+remove_rule() {
+  while ip rule show | grep -q "from ${SUBNET} lookup ${TABLE_ID}"; do
+    ip rule del from "${SUBNET}" lookup "${TABLE_ID}" priority "${RULE_PRIO}" 2>/dev/null || \
+      ip rule del from "${SUBNET}" lookup "${TABLE_ID}" 2>/dev/null || break
+  done
+}
+
+nft_apply() {
+  local iface="$1"
+  local mss="$2"
+  [[ -x "${NFT_BIN}" ]] || die "нужен nftables (пакет nftables)"
+
+  "${NFT_BIN}" delete table inet "${NFT_TABLE}" 2>/dev/null || true
+  "${NFT_BIN}" -f - <<EOF
+table inet ${NFT_TABLE} {
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    ct state established,related accept
+    iifname "${VETH_HOST}" oifname "${iface}" tcp flags syn tcp option maxseg size set ${mss} accept
+    iifname "${VETH_HOST}" oifname "${iface}" accept
+    iifname "${iface}" oifname "${VETH_HOST}" accept
+    iifname "${VETH_HOST}" counter drop
+    oifname "${VETH_HOST}" counter drop
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr ${SUBNET} oifname "${iface}" masquerade
+  }
+}
+EOF
+}
+
+nft_remove() {
+  [[ -x "${NFT_BIN}" ]] || return 0
+  "${NFT_BIN}" delete table inet "${NFT_TABLE}" 2>/dev/null || true
+}
+
+calc_mss() {
+  local mtu="$1" mss
+  mss=$((mtu - 40))
+  if (( mss < 536 )); then mss=536; fi
+  printf '%s\n' "${mss}"
+}
+
+repair_ns() {
+  local iface mtu mss quiet="${1:-}"
+  ns_exists || {
+    [[ "${quiet}" == "quiet" ]] || die "namespace ${NS_NAME} не поднят (сначала --up или запуск приложения)"
+    return 1
+  }
+
+  if iface="$(detect_vpn_iface)" && vpn_is_up "${iface}"; then
+    mtu="$(vpn_mtu "${iface}")"
+    mss="$(calc_mss "${mtu}")"
+    ensure_forwarding "${iface}"
+    ensure_routes "${iface}"
+    ensure_rule
+    nft_apply "${iface}" "${mss}"
+    ip link set "${VETH_HOST}" mtu "${mtu}" up 2>/dev/null || true
+    ip -n "${NS_NAME}" link set "${VETH_NS}" mtu "${mtu}" up 2>/dev/null || true
+    [[ "${quiet}" == "quiet" ]] || log "repaired via ${iface}"
+    return 0
+  fi
+
+  # VPN нет — оставляем только blackhole (kill switch активен).
+  ensure_blackhole_only
+  ensure_rule
+  [[ "${quiet}" == "quiet" ]] || log "VPN down — blackhole active"
+  return 0
+}
+
+watcher_running() {
+  local pid
+  [[ -f "${WATCH_PID_FILE}" ]] || return 1
+  pid="$(<"${WATCH_PID_FILE}")"
+  [[ -n "${pid}" ]] || return 1
+  kill -0 "${pid}" 2>/dev/null
+}
+
+stop_watcher() {
+  local pid
+  if [[ -f "${WATCH_PID_FILE}" ]]; then
+    pid="$(<"${WATCH_PID_FILE}")"
+    if [[ -n "${pid}" ]]; then
+      kill "${pid}" 2>/dev/null || true
+      # даём циклу завершиться
+      sleep 0.1 || true
+      kill -9 "${pid}" 2>/dev/null || true
+    fi
+    rm -f "${WATCH_PID_FILE}"
+  fi
+}
+
+ensure_watcher() {
+  local pid
+  if watcher_running; then
+    return 0
+  fi
+  rm -f "${WATCH_PID_FILE}"
+
+  (
+    # Отвязка от терминала/запускающего процесса.
+    exec </dev/null
+    while ns_exists; do
+      if iface="$(detect_vpn_iface 2>/dev/null || true)" && [[ -n "${iface}" ]] && vpn_is_up "${iface}"; then
+        if ! routes_ok_for "${iface}"; then
+          repair_ns quiet || true
+        fi
+      else
+        # Интерфейс пропал — убеждаемся, что остался blackhole, а не stale routes.
+        if ip route show table "${TABLE_ID}" 2>/dev/null | grep -qE 'dev (amn0|wg0|tun0)'; then
+          ensure_blackhole_only || true
+        elif ! ip route show table "${TABLE_ID}" 2>/dev/null | grep -q blackhole; then
+          ensure_blackhole_only || true
+        fi
+      fi
+      sleep "${WATCH_INTERVAL_SEC}"
+    done
+    rm -f "${WATCH_PID_FILE}"
+  ) &
+  pid=$!
+  echo "${pid}" >"${WATCH_PID_FILE}"
+  disown "${pid}" 2>/dev/null || true
+  log "watcher pid=${pid}"
+}
+
+setup_ns() {
+  local iface mtu mss
+  iface="$(detect_vpn_iface)" || die "VPN-интерфейс не найден (amn0/wg0/…). Поднимите Amnezia или задайте VPN_IFACE=..."
+  vpn_is_up "${iface}" || die "интерфейс ${iface} есть, но не UP"
+  mtu="$(vpn_mtu "${iface}")"
+  mss="$(calc_mss "${mtu}")"
+
+  ensure_forwarding "${iface}"
+  install_dns
+
+  if ! ns_exists; then
+    ip netns add "${NS_NAME}"
+  fi
+
+  # lo в namespace
+  ip -n "${NS_NAME}" link set lo up 2>/dev/null || true
+
+  if ! ip link show "${VETH_HOST}" >/dev/null 2>&1; then
+    cleanup_stale_links
+    ip link add "${VETH_HOST}" type veth peer name "${VETH_NS}"
+    ip link set "${VETH_NS}" netns "${NS_NAME}"
+  elif ! ip -n "${NS_NAME}" link show "${VETH_NS}" >/dev/null 2>&1; then
+    # Хост-конец есть, peer потерян — пересоздаём.
+    cleanup_stale_links
+    ip link add "${VETH_HOST}" type veth peer name "${VETH_NS}"
+    ip link set "${VETH_NS}" netns "${NS_NAME}"
+  fi
+
+  ip addr replace "${HOST_IP}/24" dev "${VETH_HOST}"
+  ip link set "${VETH_HOST}" mtu "${mtu}" up
+  ensure_forwarding "${iface}"
+
+  ip -n "${NS_NAME}" addr replace "${NS_IP}/24" dev "${VETH_NS}"
+  ip -n "${NS_NAME}" link set "${VETH_NS}" mtu "${mtu}" up
+  ip -n "${NS_NAME}" route replace default via "${HOST_IP}" dev "${VETH_NS}"
+
+  # Режем IPv6 в namespace — типичный вектор обхода kill switch.
+  ip netns exec "${NS_NAME}" "${SYSCTL_BIN}" -q -w net.ipv6.conf.all.disable_ipv6=1 2>/dev/null || true
+  ip netns exec "${NS_NAME}" "${SYSCTL_BIN}" -q -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
+
+  ensure_routes "${iface}"
+  ensure_rule
+  nft_apply "${iface}" "${mss}"
+  ensure_watcher
+
+  log "ready (ns=${NS_NAME} vpn=${iface} host=${HOST_IP} ns_ip=${NS_IP} mtu=${mtu})"
+}
+
+teardown_ns() {
+  stop_watcher
+  nft_remove
+  remove_rule
+  flush_table
+  cleanup_stale_links
+  if ns_exists; then
+    ip netns delete "${NS_NAME}" 2>/dev/null || true
+  fi
+  # /etc/netns/<name>/resolv.conf оставляем — безвредно и удобно при повторном up.
+  log "torn down (${NS_NAME})"
+}
+
+show_status() {
+  local iface="" watch="no"
+  iface="$(detect_vpn_iface 2>/dev/null || true)"
+  if watcher_running; then watch="yes (pid=$(<"${WATCH_PID_FILE}"))"; fi
+  printf 'namespace: %s (%s)\n' "${NS_NAME}" "$(ns_exists && echo exists || echo absent)"
+  printf 'vpn iface: %s\n' "${iface:-none}"
+  if [[ -n "${iface}" ]]; then
+    printf 'vpn up:    %s\n' "$(vpn_is_up "${iface}" && echo yes || echo no)"
+  fi
+  printf 'veth host: %s\n' "$(ip link show "${VETH_HOST}" >/dev/null 2>&1 && echo up || echo absent)"
+  printf 'watcher:   %s\n' "${watch}"
+  printf 'ip rule:\n'
+  ip rule show | grep -E "${TABLE_ID}|${SUBNET}" || printf '  (none)\n'
+  printf 'table %s:\n' "${TABLE_ID}"
+  ip route show table "${TABLE_ID}" 2>/dev/null || printf '  (empty)\n'
+  if [[ -x "${NFT_BIN}" ]]; then
+    printf 'nft:\n'
+    "${NFT_BIN}" list table inet "${NFT_TABLE}" 2>/dev/null || printf '  (absent)\n'
+  fi
+  if ns_exists; then
+    printf 'ns routes:\n'
+    ip -n "${NS_NAME}" route show 2>/dev/null || true
+  fi
+}
+
+run_cmd() {
+  local iface user
+  iface="$(detect_vpn_iface)" || die "VPN-интерфейс не найден — сначала подключите Amnezia"
+  vpn_is_up "${iface}" || die "VPN (${iface}) не UP — kill switch не пускает запуск"
+
+  setup_ns
+
+  user="${SUDO_USER:-}"
+  if [[ -n "${user}" && "${user}" != "root" ]]; then
+    local user_home
+    user_home="$(getent passwd "${user}" | cut -d: -f6)"
+    [[ -n "${user_home}" ]] || user_home="/home/${user}"
+    # runuser: GUI/сессионные переменные прокидываем явно.
+    exec ip netns exec "${NS_NAME}" "${RUNUSER_BIN}" -u "${user}" -- \
+      env \
+      DISPLAY="${DISPLAY-}" \
+      XAUTHORITY="${XAUTHORITY-}" \
+      WAYLAND_DISPLAY="${WAYLAND_DISPLAY-}" \
+      XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR-}" \
+      DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS-}" \
+      HOME="${user_home}" \
+      LANG="${LANG-}" \
+      LC_ALL="${LC_ALL-}" \
+      QT_QPA_PLATFORM="${QT_QPA_PLATFORM-}" \
+      XDG_SESSION_TYPE="${XDG_SESSION_TYPE-}" \
+      "$@"
+  fi
+  exec ip netns exec "${NS_NAME}" "$@"
+}
+
+usage() {
+  cat <<'EOF'
+Использование:
+  vpn-ns-run [--up|--down|--status|--repair] [команда [аргументы...]]
+
+  vpn-ns-run curl -4 https://ifconfig.me
+  vpn-ns-run --up
+  vpn-ns-run --down
+  vpn-ns-run --status
+  vpn-ns-run --repair
+
+Переменные: VPN_IFACE VPN_IFACES VPN_NS_NAME VPN_HOST_IP VPN_NS_IP VPN_SUBNET
+EOF
+}
+
+main() {
+  need_root "$@"
+
+  [[ -x "${IP_BIN}" ]] || die "нужен iproute2"
+  [[ -x "${NFT_BIN}" ]] || die "нужен nftables (apt install nftables)"
+
+  case "${1-}" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --up)
+      setup_ns
+      exit 0
+      ;;
+    --down)
+      teardown_ns
+      exit 0
+      ;;
+    --status)
+      show_status
+      exit 0
+      ;;
+    --repair)
+      repair_ns
+      ensure_watcher
+      exit 0
+      ;;
+    --)
+      shift
+      [[ $# -gt 0 ]] || die "укажите команду"
+      run_cmd "$@"
+      ;;
+    "")
+      usage
+      exit 2
+      ;;
+    *)
+      run_cmd "$@"
+      ;;
+  esac
+}
+
+main "$@"

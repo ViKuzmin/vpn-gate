@@ -1,0 +1,11 @@
+# Allow members of netdev (and sudo) to manage Amnezia kill-switch namespace
+# without an interactive password prompt. Needed for GUI launch of gated apps.
+#
+# SETENV — чтобы vpn-ns-run получал DISPLAY/XAUTHORITY/VPN_IFACE из сессии пользователя.
+#
+# Installed as /etc/sudoers.d/vpn-ns-run by the vpn-gate package.
+Cmnd_Alias VPN_NS_RUN = /usr/bin/vpn-ns-run *
+Defaults!VPN_NS_RUN !requiretty
+Defaults!VPN_NS_RUN env_keep += "DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS LANG LC_ALL QT_QPA_PLATFORM XDG_SESSION_TYPE VPN_IFACE VPN_IFACES VPN_NS_NAME"
+%netdev ALL=(root) NOPASSWD:SETENV: VPN_NS_RUN
+%sudo ALL=(root) NOPASSWD:SETENV: VPN_NS_RUN
